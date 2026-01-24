@@ -1,0 +1,7 @@
+numpy>=1.20.0
+opencv-python>=4.5.0
+ultralytics>=8.0.0
+# freenect and pylibfreenect2 are system-dependent and often not installable via pip directly on all platforms without system libs.
+# They are listed here for documentation purposes.
+# freenect
+# pylibfreenect2
