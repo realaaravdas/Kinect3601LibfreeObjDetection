@@ -6,11 +6,11 @@ import logging
 class Kinect360(KinectInterface):
     def __init__(self):
         try:
-            import freenect
+            from . import kinect_driver as freenect
             self.freenect = freenect
         except ImportError:
             self.freenect = None
-            logging.error("freenect module not found. Please install libfreenect.")
+            logging.error("kinect_driver module not found or failed to load.")
 
     def open(self):
         if self.freenect is None:
