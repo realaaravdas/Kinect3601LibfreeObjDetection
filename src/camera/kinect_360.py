@@ -29,7 +29,8 @@ class Kinect360(KinectInterface):
             rgb, _ = self.freenect.sync_get_video()
 
             # sync_get_depth returns (data, timestamp)
-            depth, _ = self.freenect.sync_get_depth()
+            # Use registered depth for RGB-D alignment (mm)
+            depth, _ = self.freenect.sync_get_depth(format=self.freenect.DEPTH_REGISTERED)
 
             return rgb, depth
         except Exception as e:

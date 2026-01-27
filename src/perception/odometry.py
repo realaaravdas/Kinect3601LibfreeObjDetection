@@ -4,93 +4,173 @@ import logging
 
 class VisualOdometry:
     def __init__(self, fov_h=57.0):
-        self.fov_h = fov_h
-        self.prev_profile = None
-        self.search_range = 60 # Max pixel shift to check
+        # We assume standard Kinect intrinsics for 640x480
+        # Kinect v1 (Xbox 360) intrinsics
+        self.W = 640
+        self.H = 480
+        self.fx = 525.0
+        self.fy = 525.0
+        self.cx = 319.5
+        self.cy = 239.5
 
-    def update(self, depth_frame):
+        self.camera_matrix = np.array([
+            [self.fx, 0, self.cx],
+            [0, self.fy, self.cy],
+            [0, 0, 1]
+        ], dtype=np.float32)
+
+        # Feature Detector (ORB is fast and efficient)
+        self.orb = cv2.ORB_create(nfeatures=1000)
+
+        # Matcher
+        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+
+        # Previous Frame State
+        self.prev_kp = None
+        self.prev_des = None
+        self.prev_depth = None
+
+        # Global Pose (Camera to World)
+        # R is rotation matrix (3x3), t is translation vector (3x1)
+        self.R_acc = np.eye(3)
+        self.t_acc = np.zeros((3, 1))
+
+        # Initializing logger
+        self.logger = logging.getLogger("VisualOdometry")
+
+    def update(self, rgb, depth):
         """
-        Estimate rotation change based on depth frame.
-
+        Estimate camera motion.
         Args:
-            depth_frame: Depth image (H, W).
+            rgb: Current RGB image (H, W, 3)
+            depth: Current Depth image (H, W) in mm (aligned/registered).
 
         Returns:
-            delta_yaw (float): Rotation change in radians.
+            pose: (x, y, z, yaw) in global frame (Camera Start Frame)
         """
-        h, w = depth_frame.shape
+        if rgb is None or depth is None:
+            return self.get_pose_vector()
 
-        # 1. Preprocess: Extract central band
-        # Use 20% of image height
-        band_h = int(h * 0.2)
-        y_start = (h - band_h) // 2
-        band = depth_frame[y_start:y_start+band_h, :]
+        # 1. Feature Detection
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        kp, des = self.orb.detectAndCompute(gray, None)
 
-        # 2. Compute Column Profile
-        # Convert to float and set 0 to NaN
-        band_float = band.astype(np.float32)
-        band_float[band_float == 0] = np.nan
+        if self.prev_kp is None or des is None or len(kp) < 10:
+            self.prev_kp = kp
+            self.prev_des = des
+            self.prev_depth = depth
+            return self.get_pose_vector()
 
-        # Calculate mean of columns ignoring NaNs
-        with np.errstate(invalid='ignore'):
-            profile = np.nanmean(band_float, axis=0)
+        if self.prev_des is None:
+             self.prev_kp = kp
+             self.prev_des = des
+             self.prev_depth = depth
+             return self.get_pose_vector()
 
-        # Fill remaining NaNs (empty columns) with nearest valid or 0
-        # Simple forward fill then backward fill
-        mask = np.isnan(profile)
-        if np.all(mask):
-            # No valid data in band
-            return 0.0
+        # 2. Match Features
+        matches = self.matcher.match(self.prev_des, des)
+        # Sort by distance
+        matches = sorted(matches, key=lambda x: x.distance)
 
-        # Basic imputation: fill with 0 or max range?
-        # Let's fill with 0, but during matching 0s might be an issue if using SQDIFF.
-        # Better: Linear interpolation.
-        x = np.arange(w)
-        profile[mask] = np.interp(x[mask], x[~mask], profile[~mask])
+        # Keep top matches
+        matches = matches[:200]
 
-        # 3. Match with previous profile
-        if self.prev_profile is None:
-            self.prev_profile = profile
-            return 0.0
+        if len(matches) < 10:
+            return self.get_pose_vector()
 
-        # We assume small rotation between frames.
-        # Template: Center part of PREVIOUS profile
-        # Source: Full CURRENT profile
+        # 3. Retrieve 3D points for Previous Features
+        pts_3d = []
+        pts_2d = []
 
-        margin = self.search_range
-        if w <= 2 * margin:
-            # Image too small for this margin
-            margin = w // 4
+        for m in matches:
+            idx_prev = m.queryIdx
+            idx_curr = m.trainIdx
 
-        template = self.prev_profile[margin:-margin]
+            # Get 2D point in prev
+            u_prev, v_prev = self.prev_kp[idx_prev].pt
+            u_prev, v_prev = int(u_prev), int(v_prev)
 
-        # Reshape for matchTemplate (1, N)
-        templ_img = template.reshape(1, -1).astype(np.float32)
-        curr_img = profile.reshape(1, -1).astype(np.float32)
+            # Check bounds
+            if 0 <= u_prev < self.W and 0 <= v_prev < self.H:
+                # Assuming depth is uint16 mm
+                d = self.prev_depth[v_prev, u_prev]
 
-        # Normalized Cross Correlation might be more robust to depth noise/scale
-        res = cv2.matchTemplate(curr_img, templ_img, cv2.TM_CCORR_NORMED)
+                # Check valid depth (0 is invalid in Kinect)
+                if d > 0:
+                    z = float(d) / 1000.0 # Convert mm to meters
 
-        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+                    x = (u_prev - self.cx) * z / self.fx
+                    y = (v_prev - self.cy) * z / self.fy
 
-        # For TM_CCORR_NORMED, we want MAX value
-        best_match_idx = max_loc[0]
+                    pts_3d.append([x, y, z])
+                    pts_2d.append(kp[idx_curr].pt)
 
-        # Calculate shift
-        # If perfectly aligned, best_match_idx should be 'margin'
-        shift = best_match_idx - margin
+        pts_3d = np.array(pts_3d, dtype=np.float32)
+        pts_2d = np.array(pts_2d, dtype=np.float32)
 
-        # Logic from thought process:
-        # If robot rotates Left (+ Yaw), scene moves Right (shift > 0).
-        # So Yaw is positive when shift is positive.
+        # 4. Solve PnP (Finds pose of Previous Points in Current Frame)
+        if len(pts_3d) < 6:
+            # Not enough points
+            self.prev_kp = kp
+            self.prev_des = des
+            self.prev_depth = depth
+            return self.get_pose_vector()
 
-        deg_per_pixel = self.fov_h / w
-        delta_deg = shift * deg_per_pixel
+        success, rvec, tvec, inliers = cv2.solvePnPRansac(
+            pts_3d, pts_2d, self.camera_matrix, None,
+            iterationsCount=100, reprojectionError=8.0, confidence=0.99
+        )
 
-        # Update previous profile
-        self.prev_profile = profile
+        if success:
+            # P_curr = R * P_prev + t
+            # Transform from Prev to Curr
+            R, _ = cv2.Rodrigues(rvec)
 
-        return np.radians(delta_deg)
+            # We want to update Global Pose: C_new = C_old * M
+            # Where M is motion from Prev to Curr.
+            # M = inverse of (R, t) because (R, t) transforms points P_prev -> P_curr
+            # which is equivalent to World moving relative to Camera.
+            # Camera movement is inverse.
+
+            R_inv = R.T
+            t_inv = -R_inv @ tvec
+
+            # Update Global Accumulation
+            # C_global_new = C_global_prev * T_local
+            self.t_acc = self.t_acc + self.R_acc @ t_inv
+            self.R_acc = self.R_acc @ R_inv
+
+        # Update Previous
+        self.prev_kp = kp
+        self.prev_des = des
+        self.prev_depth = depth
+
+        return self.get_pose_vector()
+
+    def get_pose_vector(self):
+        """
+        Returns (x, y, z, yaw) in meters and radians.
+        Coordinates are relative to the initial camera frame:
+        x: Right
+        y: Down
+        z: Forward
+        yaw: Rotation around Y axis
+        """
+        x = self.t_acc[0, 0]
+        y = self.t_acc[1, 0]
+        z = self.t_acc[2, 0]
+
+        # Extract yaw from R_acc
+        # Z-axis direction vector
+        forward = self.R_acc[:, 2]
+        # Project on X-Z plane
+        yaw = np.arctan2(forward[0], forward[2])
+
+        return x, y, z, yaw
 
     def reset(self):
-        self.prev_profile = None
+        self.prev_kp = None
+        self.prev_des = None
+        self.prev_depth = None
+        self.R_acc = np.eye(3)
+        self.t_acc = np.zeros((3, 1))
