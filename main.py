@@ -4,20 +4,33 @@ import logging
 import sys
 import numpy as np
 import threading
+import multiprocessing
 import cv2
 
-# Adjust path if needed, but since main.py is in root, src should be importable
+# Adjust path if needed
 from src.camera import Kinect360, KinectOne, DummyCamera
 from src.camera.camera_thread import CameraThread
-from src.perception import ObjectDetector, DepthProcessor, VisualOdometry
-from src.perception.detection_thread import DetectionThread
+from src.perception.geometry import CameraProjector
+from src.perception.odometry import VisualOdometry
+from src.perception.detection_process import DetectionProcess
 from src.mapping import MapManager
 from src.ui import Display, CLI
 
+# Needed for multiprocessing in some environments
+def setup_multiprocessing():
+    try:
+        multiprocessing.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass
+
 def main():
+    setup_multiprocessing()
+
     parser = argparse.ArgumentParser(description="Kinect Object Detector & Mapper")
     parser.add_argument("--camera", choices=["360", "one", "dummy"], default="dummy", help="Camera type")
     parser.add_argument("--model", default="yolov8n.pt", help="Path to YOLO model")
+    parser.add_argument("--height", type=float, default=1.0, help="Camera height in meters")
+    parser.add_argument("--tilt", type=float, default=0.0, help="Camera tilt in degrees (positive up)")
     args = parser.parse_args()
 
     # Logging setup
@@ -25,15 +38,26 @@ def main():
 
     # 1. Init Camera Hardware
     logging.info(f"Initializing {args.camera} camera...")
+
+    # Default intrinsics placeholders (will be updated when frame is received)
+    width, height = 640, 480
+    fov_h = 57.0
+    fov_v = 43.0
+
     if args.camera == "360":
         cam_hw = Kinect360()
-        fov = 57.0
+        fov_h = 57.0
+        fov_v = 43.0
+        width, height = 640, 480
     elif args.camera == "one":
         cam_hw = KinectOne()
-        fov = 70.6
+        fov_h = 70.6
+        fov_v = 60.0
+        width, height = 512, 424 # As per kinect_one.py Registration choice
     else:
         cam_hw = DummyCamera()
-        fov = 60.0
+        fov_h = 60.0
+        width, height = 640, 480
 
     try:
         cam_hw.open()
@@ -44,83 +68,103 @@ def main():
     # Startup Sequence (360)
     if args.camera == "360":
         cam_hw.startup_sequence()
+        # If user specified tilt via CLI, apply it now?
+        # But startup sequence resets to 0.
+        if args.tilt != 0:
+            cam_hw.set_tilt(args.tilt)
 
     # 2. Start Camera Thread
-    # This decouples camera capture (30fps) from processing
     cam_thread = CameraThread(cam_hw)
     cam_thread.start()
 
-    # Wait for camera to warm up and provide first frame
+    # Wait for camera
     logging.info("Waiting for camera stream...")
     frame_ready = False
-    for _ in range(50): # Wait up to 5 seconds
-        if cam_thread.get_latest_frame()[0] is not None:
+    for _ in range(50):
+        rgb, _ = cam_thread.get_latest_frame()
+        if rgb is not None:
             frame_ready = True
+            # Update width/height based on actual frame
+            height, width, _ = rgb.shape
             break
         time.sleep(0.1)
 
     if not frame_ready:
-        logging.error("Camera failed to provide frames. Exiting.")
+        logging.error("Camera failed to provide frames.")
         cam_thread.stop()
         return
 
-    # 3. Init Perception & Mapping
-    # Detector (YOLO) - Heavy, put in thread
-    detector = ObjectDetector(args.model)
-    det_thread = DetectionThread(detector)
-    det_thread.start()
+    logging.info(f"Camera started. Resolution: {width}x{height}")
 
-    # Depth Processor & Odometry
-    depth_proc = DepthProcessor(fov_h=fov)
-    odom = VisualOdometry(fov_h=fov)
-    mapper = MapManager()
+    # 3. Init Perception & Mapping
+
+    # Projector
+    projector = CameraProjector(fov_h=fov_h, fov_v=fov_v, cam_height=args.height, tilt_angle=args.tilt)
+
+    # Odometry (Initialize with correct resolution)
+    odom = VisualOdometry(fov_h=fov_h, width=width, height=height)
+
+    # Mapping
+    mapper = MapManager(projector=projector)
+
+    # Detection (Multiprocessing)
+    frame_queue = multiprocessing.Queue(maxsize=2)
+    result_queue = multiprocessing.Queue()
+
+    det_process = DetectionProcess(args.model, frame_queue, result_queue)
+    det_process.start()
 
     # 4. Init UI
     display = Display()
     cli = CLI()
 
-    logging.info("Starting main loop. Press 'q' in console or GUI window to quit.")
+    logging.info("Starting main loop...")
 
     try:
         while True:
-            # 1. Get Latest Frame (Instant)
+            # 1. Get Frame
             rgb, depth = cam_thread.get_latest_frame()
             if rgb is None:
                 time.sleep(0.001)
                 continue
 
-            # 2. Visual Odometry (Fast, C++ backed)
-            # Update robot pose based on visual features
+            # 2. Update Configuration (if changed via CLI)
+            # (CLI tilt changes handled below, need to update Projector)
+
+            # 3. Visual Odometry
             pose = odom.update(rgb, depth)
             mapper.update_pose(pose)
 
-            # 3. Object Detection (Async)
-            # Send current frame to detection thread
-            det_thread.process_frame(rgb)
+            # 4. Object Detection (Async)
+            # Try push frame
+            try:
+                # Only push if queue is empty to avoid lag?
+                # Or use maxsize=2 and put_nowait
+                if not frame_queue.full():
+                    frame_queue.put_nowait(rgb)
+            except queue.Full:
+                pass
 
-            # Get latest available results
-            results = det_thread.get_latest_results()
+            # Get Results
+            detections = []
+            try:
+                while True:
+                    detections = result_queue.get_nowait()
+            except queue.Empty:
+                pass
 
-            # 4. Map Updates using Detection Results
-            if results and results.boxes:
-                for box in results.boxes:
-                    coords = box.xyxy[0].cpu().numpy()
-                    cls = int(box.cls[0].item()) if box.cls.numel() > 0 else 0
-                    conf = float(box.conf[0].item()) if box.conf.numel() > 0 else 0.0
+            # 5. Map Updates
+            # MapManager now handles projection, persistence, etc.
+            if depth is not None:
+                H, W = depth.shape
+                mapper.update_map(detections, depth, W, H)
 
-                    # Estimate Distance using CURRENT depth
-                    dist, angle = depth_proc.get_distance_and_angle(depth, coords)
-
-                    if dist is not None:
-                        mapper.add_observation(cls, dist, angle, conf)
-
-            # 5. Display
-            # Show the RGB frame (current) and overlay *latest* detections.
-            key = display.show(rgb, results, mapper.get_objects(), mapper.get_pose())
+            # 6. Display
+            key = display.show(rgb, detections, mapper.get_objects(), mapper.get_pose(), mapper.get_frustum())
             if key == ord('q'):
                 break
 
-            # 6. CLI
+            # 7. CLI
             cmd = cli.get_command()
             if cmd:
                 if cmd in ["q", "quit", "exit"]:
@@ -129,24 +173,27 @@ def main():
                     try:
                         angle = float(cmd.split()[1])
                         cam_hw.set_tilt(angle)
+                        projector.update_config(projector.height, angle) # Sync projector
                         logging.info(f"Tilt set to {angle}")
                     except ValueError:
                         logging.error("Invalid tilt angle")
                 elif cmd == "reset":
                     odom.reset()
-                    logging.info("Odometry reset")
 
     except KeyboardInterrupt:
         pass
     except Exception as e:
-        logging.error(f"An error occurred: {e}", exc_info=True)
+        logging.error(f"Error: {e}", exc_info=True)
     finally:
         logging.info("Shutting down...")
         cam_thread.stop()
-        det_thread.stop()
+
+        # Kill Detection Process
+        det_process.terminate()
+        det_process.join()
+
         cli.stop()
         display.close()
-        # cam_hw.close()
 
 if __name__ == "__main__":
     main()
