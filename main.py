@@ -5,6 +5,7 @@ import sys
 import numpy as np
 import threading
 import multiprocessing
+import queue
 import cv2
 
 # Adjust path if needed
@@ -24,6 +25,7 @@ def setup_multiprocessing():
         pass
 
 def main():
+    import queue # Ensure queue is available in local scope
     setup_multiprocessing()
 
     parser = argparse.ArgumentParser(description="Kinect Object Detector & Mapper")

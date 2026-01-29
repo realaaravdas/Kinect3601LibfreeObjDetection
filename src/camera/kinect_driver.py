@@ -146,6 +146,12 @@ def _load_libraries():
         _lib_sync.freenect_sync_get_depth.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_uint32), ctypes.c_int, ctypes.c_int]
         _lib_sync.freenect_sync_get_depth.restype = ctypes.c_int
 
+        # void freenect_sync_stop(void);
+        # This is useful to cleanly close streams
+        if hasattr(_lib_sync, 'freenect_sync_stop'):
+            _lib_sync.freenect_sync_stop.argtypes = []
+            _lib_sync.freenect_sync_stop.restype = None
+
 # Load libs on module import
 _load_libraries()
 
@@ -189,6 +195,10 @@ def set_led(dev, option):
     if res < 0:
         logger.error(f"freenect_set_led failed with code {res}")
 
+def sync_stop():
+    if _lib_sync and hasattr(_lib_sync, 'freenect_sync_stop'):
+        _lib_sync.freenect_sync_stop()
+
 def sync_get_video(index=0, format=VIDEO_RGB):
     if _lib_sync is None:
         raise RuntimeError("libfreenect_sync not loaded")
@@ -196,9 +206,19 @@ def sync_get_video(index=0, format=VIDEO_RGB):
     video_ptr = ctypes.c_void_p()
     timestamp = ctypes.c_uint32()
 
-    res = _lib_sync.freenect_sync_get_video(ctypes.byref(video_ptr), ctypes.byref(timestamp), index, format)
+    # Retry loop for sync issues
+    for i in range(3):
+        res = _lib_sync.freenect_sync_get_video(ctypes.byref(video_ptr), ctypes.byref(timestamp), index, format)
+        if res == 0:
+            break
+        # If failure, maybe log and retry
+        # res != 0 usually means timeout or error
+        # "Lost too many packets" usually prints to stderr but function returns error
+        logger.warning(f"freenect_sync_get_video failed (attempt {i+1})")
+
     if res != 0:
-        raise RuntimeError("freenect_sync_get_video failed")
+        # Don't raise, just return None. Thread will sleep.
+        return None, 0
 
     # Determine size and shape
     if format == VIDEO_RGB:
@@ -208,40 +228,18 @@ def sync_get_video(index=0, format=VIDEO_RGB):
         size = width * height * channels
         array_type = ctypes.c_uint8 * size
 
-        # Cast void pointer to array pointer
         buffer_ptr = ctypes.cast(video_ptr, ctypes.POINTER(array_type))
-        # Create numpy array from buffer
-        # Note: np.frombuffer or np.ctypeslib.as_array
-        # as_array creates a view, frombuffer creates a copy usually unless using proper buffer interface
-        # Since the buffer is owned by freenect_sync and valid until next call,
-        # using a copy is safer if we want to process it while next frame is grabbed.
-        # However, for speed, a view is better, but we must be careful.
-        # Original freenect.sync_get_video() returns a COPY usually?
-        # Let's use np.ctypeslib.as_array which creates a numpy array sharing memory.
-        # But wait, freenect_sync docs say: "The returned buffer is valid until this function is called again"
-        # So if we hold onto this array and call sync_get_video again, the data changes.
-        # We should probably return a copy to be safe, like standard python wrappers usually do.
-
         arr = np.ctypeslib.as_array(buffer_ptr.contents)
-        arr = arr.reshape((480, 640, 3)).copy() # Ensure we have a copy and correct shape
+        arr = arr.reshape((480, 640, 3)).copy()
 
     elif format == VIDEO_IR_8BIT:
-        width, height = 640, 488 # IR is 640x488? Header says MEDIUM is 640x488 for IR
-        # Wait, libfreenect.h says: "FREENECT_RESOLUTION_MEDIUM is 640x488 for the IR camera."
-        # Standard usage often crops or assumes 640x480.
-        # Let's assume 640x480 for now or check size.
-        # Actually, let's just implement RGB as primary requirement.
-        # If the user uses IR, they might need adjustments.
-        # For now, I'll stick to RGB logic as primary.
-
-        # If someone asks for IR, we can try generic size
-        size = 640 * 488
+        width, height = 640, 488
+        size = width * height
         array_type = ctypes.c_uint8 * size
         buffer_ptr = ctypes.cast(video_ptr, ctypes.POINTER(array_type))
         arr = np.ctypeslib.as_array(buffer_ptr.contents).reshape((488, 640)).copy()
 
     else:
-        # Fallback or error
         raise NotImplementedError(f"Video format {format} not fully implemented yet in kinect_driver.py")
 
     return arr, timestamp.value
@@ -253,9 +251,15 @@ def sync_get_depth(index=0, format=DEPTH_11BIT):
     depth_ptr = ctypes.c_void_p()
     timestamp = ctypes.c_uint32()
 
-    res = _lib_sync.freenect_sync_get_depth(ctypes.byref(depth_ptr), ctypes.byref(timestamp), index, format)
+    # Retry loop
+    for i in range(3):
+        res = _lib_sync.freenect_sync_get_depth(ctypes.byref(depth_ptr), ctypes.byref(timestamp), index, format)
+        if res == 0:
+            break
+        logger.warning(f"freenect_sync_get_depth failed (attempt {i+1})")
+
     if res != 0:
-        raise RuntimeError("freenect_sync_get_depth failed")
+        return None, 0
 
     # Depth is usually 640x480
     width, height = 640, 480
