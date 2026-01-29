@@ -24,7 +24,7 @@ class VisualOdometry:
             [0, 0, 1]
         ], dtype=np.float32)
 
-        self.orb = cv2.ORB_create(nfeatures=1500)
+        self.orb = cv2.ORB_create(nfeatures=800)
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 
         # Keyframe State
@@ -85,7 +85,7 @@ class VisualOdometry:
         # Match against KEYFRAME
         matches = self.matcher.match(self.kf_des, des)
         matches = sorted(matches, key=lambda x: x.distance)
-        matches = matches[:300]
+        matches = matches[:200]
 
         if len(matches) < 10:
             return self.get_pose_vector()

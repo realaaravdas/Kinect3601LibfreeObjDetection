@@ -36,18 +36,20 @@ class DetectionProcess(multiprocessing.Process):
 
         while True:
             try:
-                # Get frame (non-blocking)
+                # Get frame (blocking with timeout to save CPU)
                 # We only want the LATEST frame.
-                # If queue has multiple, skip to last.
-                frame = None
                 try:
+                    frame = self.input_queue.get(timeout=0.01)
+                    # If queue has more, drain it to get the very last one
                     while True:
-                        frame = self.input_queue.get_nowait()
+                        try:
+                            frame = self.input_queue.get_nowait()
+                        except queue.Empty:
+                            break
                 except queue.Empty:
-                    pass
+                    continue
 
                 if frame is None:
-                    time.sleep(0.01)
                     continue
 
                 # Run Detection
