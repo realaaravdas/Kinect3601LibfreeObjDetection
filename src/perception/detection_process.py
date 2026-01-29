@@ -2,7 +2,7 @@ import multiprocessing
 import time
 import logging
 import queue
-import cv2
+import os
 
 class DetectionProcess(multiprocessing.Process):
     def __init__(self, model_path, input_queue, result_queue):
@@ -24,10 +24,18 @@ class DetectionProcess(multiprocessing.Process):
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
         logging.info("DetectionProcess: Initializing...")
 
-        # Import locally to avoid issues in parent process
         try:
-            from src.perception.detector import ObjectDetector
-            detector = ObjectDetector(self.model_path)
+            from ultralytics import YOLO
+
+            # Check if optimized model exists
+            ncnn_path = self.model_path.replace(".pt", "_ncnn_model")
+            if os.path.isdir(ncnn_path):
+                logging.info(f"Loading NCNN optimized model: {ncnn_path}")
+                detector = YOLO(ncnn_path, task='detect')
+            else:
+                logging.info(f"Loading standard model: {self.model_path}")
+                detector = YOLO(self.model_path)
+
         except Exception as e:
             logging.error(f"DetectionProcess: Failed to load model: {e}")
             return
@@ -37,12 +45,11 @@ class DetectionProcess(multiprocessing.Process):
         while True:
             try:
                 # Get frame (non-blocking)
-                # We only want the LATEST frame.
-                # If queue has multiple, skip to last.
                 frame = None
                 try:
+                    # Skip to latest frame if multiple
                     while True:
-                        frame = self.input_queue.get_nowait()
+                         frame = self.input_queue.get_nowait()
                 except queue.Empty:
                     pass
 
@@ -50,28 +57,26 @@ class DetectionProcess(multiprocessing.Process):
                     time.sleep(0.01)
                     continue
 
-                # Run Detection
-                results = detector.detect(frame)
+                # Run Tracking
+                # persist=True is needed for ID tracking
+                # tracker="bytetrack.yaml" is standard
+                # verbose=False reduces log spam
+                # stream=True ?? No, we process one by one here.
+                results = detector.track(frame, persist=True, tracker="bytetrack.yaml", verbose=False)
 
-                # We cannot put the entire Results object if it contains Tensors/complex types that don't pickle well?
-                # Ultralytics Results are pickleable usually, but let's be safe and extract data.
-                # Actually, main.py expects Results object or similar.
-                # Let's try sending the object. If it fails, we strip it down.
-                # However, Results object holds ref to original image. We might not want to send that back?
-                # Ideally we just send boxes, classes, confs.
-
-                # To be safe and efficient:
                 boxes_data = []
-                if results and results.boxes:
-                    for box in results.boxes:
+                if results and results[0].boxes:
+                    for box in results[0].boxes:
+                        # Extract ID if available
+                        obj_id = int(box.id[0].item()) if box.id is not None else -1
+
                         boxes_data.append({
                             'xyxy': box.xyxy[0].cpu().numpy(),
                             'cls': int(box.cls[0].item()) if box.cls.numel() > 0 else 0,
-                            'conf': float(box.conf[0].item()) if box.conf.numel() > 0 else 0.0
+                            'conf': float(box.conf[0].item()) if box.conf.numel() > 0 else 0.0,
+                            'id': obj_id
                         })
 
-                # Put in result queue
-                # Clear old results? No, consumer handles that.
                 self.result_queue.put(boxes_data)
 
             except KeyboardInterrupt:

@@ -33,10 +33,22 @@ def main():
     parser.add_argument("--model", default="yolov8n.pt", help="Path to YOLO model")
     parser.add_argument("--height", type=float, default=1.0, help="Camera height in meters")
     parser.add_argument("--tilt", type=float, default=0.0, help="Camera tilt in degrees (positive up)")
+    parser.add_argument("--optimize", action="store_true", help="Optimize model to NCNN/ONNX on startup")
     args = parser.parse_args()
 
     # Logging setup
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+    # 0. Optimization Step
+    if args.optimize:
+        logging.info("Optimizing model (this may take a while)...")
+        try:
+            from ultralytics import YOLO
+            model = YOLO(args.model)
+            model.export(format='ncnn')
+            logging.info("Model optimized to NCNN.")
+        except Exception as e:
+            logging.error(f"Optimization failed: {e}")
 
     # 1. Init Camera Hardware
     logging.info(f"Initializing {args.camera} camera...")

@@ -32,7 +32,7 @@ class MapManager:
         """
         Process detections and update map.
         Args:
-            detections: List of dicts {'xyxy', 'cls', 'conf'}
+            detections: List of dicts {'xyxy', 'cls', 'conf', 'id'}
             depth_frame: Depth image (mm)
             W, H: Dimensions
         """
@@ -41,15 +41,13 @@ class MapManager:
 
         # 1. Decay Confidence of Unseen Objects
         # Identify which objects are in Frustum but NOT matched
-        # For simplicity: Decrease hits of ALL objects in frustum, then increment if matched.
         in_view_indices = []
+        frustum = self.projector.get_frustum_polygon(self.robot_pose)
+
         for i, obj in enumerate(self.objects):
             if self.projector.is_in_frustum(obj['x'], obj['y'], self.robot_pose):
                 in_view_indices.append(i)
-                # Decay logic:
-                # e.g., obj['misses'] += 1
-                # We'll implement a 'health' system.
-                obj['health'] -= 1
+                obj['health'] -= 2 # Decay faster
 
         # 2. Process New Detections
         if detections:
@@ -57,13 +55,13 @@ class MapManager:
                 box = det['xyxy']
                 cls = det['cls']
                 conf = det['conf']
+                track_id = det.get('id', -1)
 
                 # Get Depth
                 x1, y1, x2, y2 = map(int, box)
                 cx = (x1 + x2) // 2
                 cy = (y1 + y2) // 2
 
-                # Sample depth (Median)
                 cx = np.clip(cx, 0, W-1)
                 cy = np.clip(cy, 0, H-1)
 
@@ -82,33 +80,37 @@ class MapManager:
                 # Project to World
                 wx, wy, wz = self.projector.pixel_to_world(cx, cy, d_m, W, H, self.robot_pose)
 
-                # Filter by Height (e.g. object must be near ground or specific height?)
-                # If camera is 1m high, floor is 0.
-                # If wz is > 2m or < -1m, maybe noise.
-                # But let's be lenient for now.
-
                 # Update/Merge
                 matched = False
-                for idx in in_view_indices:
-                    obj = self.objects[idx]
-                    dist = np.sqrt((obj['x'] - wx)**2 + (obj['y'] - wy)**2)
 
-                    if dist < self.merge_threshold and obj['class_id'] == cls:
-                        # Match Found
-                        # Update position (weighted moving average)
-                        alpha = 0.3
-                        obj['x'] = (1-alpha)*obj['x'] + alpha*wx
-                        obj['y'] = (1-alpha)*obj['y'] + alpha*wy
-                        obj['z'] = (1-alpha)*obj.get('z', 0) + alpha*wz
-                        obj['confidence'] = max(obj['confidence'], conf)
-                        obj['health'] = min(obj['health'] + 2, 100) # Heal
-                        matched = True
-                        break
+                # Try to match by Track ID first
+                if track_id != -1:
+                    for idx in in_view_indices:
+                        obj = self.objects[idx]
+                        if obj.get('track_id') == track_id:
+                            self._update_object(obj, wx, wy, wz, conf)
+                            matched = True
+                            break
+
+                # If no ID match, spatial match
+                if not matched:
+                    for idx in in_view_indices:
+                        obj = self.objects[idx]
+                        dist = np.sqrt((obj['x'] - wx)**2 + (obj['y'] - wy)**2)
+
+                        if dist < self.merge_threshold and obj['class_id'] == cls:
+                            self._update_object(obj, wx, wy, wz, conf)
+                            # Associate ID if new
+                            if track_id != -1:
+                                obj['track_id'] = track_id
+                            matched = True
+                            break
 
                 if not matched:
                     # Create new object
                     self.objects.append({
                         'id': self.next_id,
+                        'track_id': track_id,
                         'class_id': cls,
                         'x': wx,
                         'y': wy,
@@ -120,6 +122,16 @@ class MapManager:
 
         # 3. Cleanup Dead Objects
         self.objects = [o for o in self.objects if o['health'] > 0]
+
+    def _update_object(self, obj, wx, wy, wz, conf):
+        # Weighted Smooth Update (Exponential Moving Average)
+        # Low alpha = smoother but more lag
+        alpha = 0.2
+        obj['x'] = (1-alpha)*obj['x'] + alpha*wx
+        obj['y'] = (1-alpha)*obj['y'] + alpha*wy
+        obj['z'] = (1-alpha)*obj.get('z', 0) + alpha*wz
+        obj['confidence'] = max(obj['confidence'], conf)
+        obj['health'] = min(obj['health'] + 5, 100) # Heal
 
     def get_objects(self):
         return self.objects
