@@ -50,6 +50,17 @@ class Display:
 
         return sx, sy
 
+    def world_to_screen_env(self, wx, wy):
+        """
+        World (wx, wy) to Screen (sx, sy) for Environment Map.
+        Center (0,0) is at (self.cx, self.cy).
+        North (+X) is UP.
+        Left (+Y) is LEFT.
+        """
+        sx = int(self.cx - wy * self.scale)
+        sy = int(self.cy - wx * self.scale)
+        return sx, sy
+
     def show(self, rgb, detections, objects, robot_pose, frustum_poly):
         # 1. Feed
         if rgb is not None:
@@ -120,6 +131,58 @@ class Display:
                 cv2.putText(map_img, label, (sx - 8, sy - 22), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
 
         cv2.imshow(f"{self.title} - Map", map_img)
+
+        # 3. Environment Map (Fixed Frame)
+        env_img = np.ones((self.H, self.W, 3), dtype=np.uint8) * 240 # Slightly darker
+
+        # Draw Grid (World Aligned)
+        # Draw lines every 1 meter
+        center_x_idx = 0
+        center_y_idx = 0
+
+        # Simple cross at 0,0
+        cx, cy = self.world_to_screen_env(0, 0)
+        cv2.line(env_img, (0, cy), (self.W, cy), (200, 200, 200), 1)
+        cv2.line(env_img, (cx, 0), (cx, self.H), (200, 200, 200), 1)
+
+        # Draw Robot
+        rx, ry, rtheta = robot_pose
+        rsx, rsy = self.world_to_screen_env(rx, ry)
+
+        # Robot Body
+        cv2.circle(env_img, (rsx, rsy), 10, (0, 0, 255), -1)
+
+        # Robot Heading
+        # Theta is CCW from X-axis.
+        # In screen coords:
+        # X is Up (-Y_screen), Y is Left (-X_screen)
+        # We need end point.
+        # EndX = rx + cos(theta)
+        # EndY = ry + sin(theta)
+        ex, ey = rx + 0.5 * np.cos(rtheta), ry + 0.5 * np.sin(rtheta)
+        esx, esy = self.world_to_screen_env(ex, ey)
+        cv2.line(env_img, (rsx, rsy), (esx, esy), (0, 0, 0), 2)
+
+        # Draw Frustum (World Coords)
+        if frustum_poly:
+            pts = []
+            for pt in frustum_poly:
+                sx, sy = self.world_to_screen_env(pt[0], pt[1])
+                pts.append([sx, sy])
+            pts = np.array(pts, np.int32)
+            cv2.polylines(env_img, [pts], True, (200, 200, 200), 2)
+
+        # Draw Objects
+        for obj in objects:
+            sx, sy = self.world_to_screen_env(obj['x'], obj['y'])
+            if 0 <= sx < self.W and 0 <= sy < self.H:
+                 color = (255, 0, 0)
+                 cv2.circle(env_img, (sx, sy), 8, color, -1)
+                 label = f"ID:{obj['id']}"
+                 cv2.putText(env_img, label, (sx - 8, sy - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+
+        cv2.imshow(f"{self.title} - Environment", env_img)
+
         return cv2.waitKey(1)
 
     def close(self):
