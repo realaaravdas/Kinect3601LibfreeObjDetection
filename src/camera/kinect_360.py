@@ -15,10 +15,13 @@ class Kinect360(KinectInterface):
     def open(self):
         if self.freenect is None:
             raise RuntimeError("freenect not available")
-        pass
+        # Initialize sync? It auto-initializes on first call usually.
+        # But we can try to "reset" it by stopping any existing.
+        self.freenect.sync_stop()
 
     def close(self):
-        pass
+        if self.freenect:
+            self.freenect.sync_stop()
 
     def get_frame(self):
         if self.freenect is None:
@@ -28,9 +31,15 @@ class Kinect360(KinectInterface):
             # sync_get_video returns (data, timestamp)
             rgb, _ = self.freenect.sync_get_video()
 
+            if rgb is None:
+                return None, None
+
             # sync_get_depth returns (data, timestamp)
             # Use registered depth for RGB-D alignment (mm)
             depth, _ = self.freenect.sync_get_depth(format=self.freenect.DEPTH_REGISTERED)
+
+            if depth is None:
+                return None, None
 
             return rgb, depth
         except Exception as e:
