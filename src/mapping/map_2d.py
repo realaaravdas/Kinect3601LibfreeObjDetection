@@ -1,6 +1,5 @@
 import numpy as np
-import ctypes
-import logging
+import math
 from src.perception.geometry import CameraProjector
 
 class MapManager:
@@ -10,17 +9,10 @@ class MapManager:
         else:
             self.projector = projector
 
-        self.lib = self.projector.lib
-
-        # Init C++ Map
-        self.lib.Map_new.argtypes = [ctypes.c_void_p]
-        self.lib.Map_new.restype = ctypes.c_void_p
-
-        self.obj = self.lib.Map_new(self.projector.obj)
-
-    def __del__(self):
-        if hasattr(self, 'lib') and hasattr(self, 'obj'):
-             self.lib.Map_delete(self.obj)
+        self.objects = [] # List of dicts
+        self.next_id = 0
+        self.merge_threshold = 1.0
+        self.robot_pose = (0.0, 0.0, 0.0) # x, y, theta
 
     def update_pose(self, cam_pose):
         if cam_pose is None:
@@ -28,79 +20,122 @@ class MapManager:
 
         x_cam, y_cam, z_cam, yaw_cam = cam_pose
 
-        self.lib.Map_update_pose.argtypes = [ctypes.c_void_p, ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double]
-        self.lib.Map_update_pose(self.obj, x_cam, y_cam, z_cam, yaw_cam)
+        # Camera Frame (Start): X-Right, Y-Down, Z-Forward
+        # Map Frame: X-Forward, Y-Left
+
+        map_x = z_cam
+        map_y = -x_cam
+        map_theta = -yaw_cam
+
+        # Normalize theta to [-pi, pi)
+        map_theta = (map_theta + math.pi) % (2 * math.pi) - math.pi
+
+        self.robot_pose = (map_x, map_y, map_theta)
 
     def update_map(self, detections, depth_frame, W, H):
         if depth_frame is None:
             return
 
-        # Prepare Detections Array
-        # [x1, y1, x2, y2, cls, conf]
-        num_dets = len(detections) if detections else 0
-        if num_dets > 0:
-            det_arr = (ctypes.c_double * (num_dets * 6))()
-            for i, det in enumerate(detections):
-                det_arr[i*6 + 0] = det['xyxy'][0]
-                det_arr[i*6 + 1] = det['xyxy'][1]
-                det_arr[i*6 + 2] = det['xyxy'][2]
-                det_arr[i*6 + 3] = det['xyxy'][3]
-                det_arr[i*6 + 4] = det['cls']
-                det_arr[i*6 + 5] = det['conf']
+        # 1. Identify objects in frustum and decay
+        in_view_indices = []
+        for i, obj in enumerate(self.objects):
+            if self.projector.is_in_frustum(obj['x'], obj['y'], self.robot_pose):
+                in_view_indices.append(i)
+                obj['health'] -= 1
+
+        if not detections:
+            # Just clean up
+            self.objects = [o for o in self.objects if o['health'] > 0]
+            return
+
+        # Prepare Depth
+        # Assume meters for calculations.
+        if depth_frame.dtype == np.uint16:
+            depth_m = depth_frame.astype(np.float32) / 1000.0
         else:
-             det_arr = None
+            # If already float, assume it is in meters
+            depth_m = depth_frame
 
-        # Prepare Depth Array
-        # Ensure it is contiguous and correct type (uint16)
-        if depth_frame.dtype != np.uint16:
-            if depth_frame.dtype == np.float32:
-                 # Assume meters -> mm
-                 depth_uint16 = (depth_frame * 1000).astype(np.uint16)
-            else:
-                 depth_uint16 = depth_frame.astype(np.uint16)
-        else:
-             depth_uint16 = depth_frame
+        # 2. Process Detections
+        stride = 2
 
-        if not depth_uint16.flags['C_CONTIGUOUS']:
-            depth_uint16 = np.ascontiguousarray(depth_uint16)
+        for det in detections:
+            # det is dict: {'xyxy': [...], 'cls': int, 'conf': float}
+            # Handle list or numpy array for xyxy
+            bbox = det['xyxy']
+            x1, y1, x2, y2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+            cls_id = int(det['cls'])
+            conf = float(det['conf'])
 
-        depth_ptr = depth_uint16.ctypes.data_as(ctypes.POINTER(ctypes.c_ushort))
+            cx = (x1 + x2) // 2
+            cy = (y1 + y2) // 2
 
-        self.lib.Map_update_map.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_double), ctypes.c_int,
-                                            ctypes.POINTER(ctypes.c_ushort), ctypes.c_int, ctypes.c_int]
+            cx = max(0, min(cx, W-1))
+            cy = max(0, min(cy, H-1))
 
-        self.lib.Map_update_map(self.obj, det_arr, num_dets, depth_ptr, W, H)
+            # Limit ROI
+            rx1 = max(0, x1)
+            ry1 = max(0, y1)
+            rx2 = min(W, x2)
+            ry2 = min(H, y2)
+
+            if rx2 <= rx1 or ry2 <= ry1:
+                continue
+
+            # Extract ROI and Stride
+            roi = depth_m[ry1:ry2:stride, rx1:rx2:stride]
+            valid_depths = roi[roi > 0]
+
+            if valid_depths.size == 0:
+                continue
+
+            d_m = np.median(valid_depths)
+
+            if d_m > self.projector.max_depth or d_m < 0.3:
+                continue
+
+            # Project
+            px, py, pz = self.projector.pixel_to_world(cx, cy, d_m, W, H, self.robot_pose)
+
+            # Match
+            matched = False
+            for idx in in_view_indices:
+                obj = self.objects[idx]
+                dist = math.sqrt((obj['x'] - px)**2 + (obj['y'] - py)**2)
+
+                if dist < self.merge_threshold and obj['class_id'] == cls_id:
+                    # Match
+                    alpha = 0.3
+                    obj['x'] = (1.0 - alpha) * obj['x'] + alpha * px
+                    obj['y'] = (1.0 - alpha) * obj['y'] + alpha * py
+                    obj['z'] = (1.0 - alpha) * obj['z'] + alpha * pz
+                    obj['confidence'] = max(obj['confidence'], conf)
+                    obj['health'] = min(obj['health'] + 10, 100)
+                    matched = True
+                    break
+
+            if not matched:
+                new_obj = {
+                    'id': self.next_id,
+                    'class_id': cls_id,
+                    'x': px,
+                    'y': py,
+                    'z': pz,
+                    'confidence': conf,
+                    'health': 50
+                }
+                self.next_id += 1
+                self.objects.append(new_obj)
+
+        # 3. Cleanup
+        self.objects = [o for o in self.objects if o['health'] > 0]
 
     def get_objects(self):
-        # Fetch objects from C++
-        self.lib.Map_get_objects.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_double), ctypes.c_int]
-        self.lib.Map_get_objects.restype = ctypes.c_int
-
-        max_objs = 100
-        buffer = (ctypes.c_double * (max_objs * 7))()
-
-        count = self.lib.Map_get_objects(self.obj, buffer, max_objs)
-
-        objects = []
-        for i in range(count):
-            obj = {
-                'id': int(buffer[i*7 + 0]),
-                'class_id': int(buffer[i*7 + 1]),
-                'x': buffer[i*7 + 2],
-                'y': buffer[i*7 + 3],
-                'z': buffer[i*7 + 4],
-                'confidence': buffer[i*7 + 5],
-                'health': int(buffer[i*7 + 6])
-            }
-            objects.append(obj)
-        return objects
+        return self.objects
 
     def get_pose(self):
-        # Fetch pose from C++
-        self.lib.Map_get_pose.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_double)]
-        pose_arr = (ctypes.c_double * 3)()
-        self.lib.Map_get_pose(self.obj, pose_arr)
-        return np.array([pose_arr[0], pose_arr[1], pose_arr[2]])
+        # Return as numpy array
+        return np.array(self.robot_pose)
 
     def get_frustum(self):
-        return self.projector.get_frustum_polygon(self.get_pose())
+        return self.projector.get_frustum_polygon(self.robot_pose)
