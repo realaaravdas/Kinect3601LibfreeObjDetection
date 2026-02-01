@@ -71,7 +71,23 @@ pip3 install torch-1.10.0a0+git36449ea-cp36-cp36m-linux_aarch64.whl
 
 `ultralytics` (YOLOv8) depends on PyTorch. Ensure the system PyTorch is detected.
 
-## 4. WSL Setup
+## 4. Orange Pi 5 Support (NPU Acceleration)
+
+To use the NPU on Orange Pi 5 (RK3588), you need `rknn-toolkit-lite2`.
+
+1. Run the installation script:
+   ```bash
+   bash scripts/install_rknn_opi5.sh
+   ```
+   This will download and install the appropriate `rknn-toolkit-lite2` wheel for your Python version.
+
+2. Usage:
+   To use hardware acceleration, you must provide an `.rknn` model (exported for RK3588).
+   ```bash
+   python3 main.py --model yolov8n.rknn --camera 360
+   ```
+
+## 5. WSL Setup
 
 WSL2 does not natively support USB devices (needed for Kinect) without `usbipd-win`.
 1. Install `usbipd-win` on Windows.
@@ -79,7 +95,7 @@ WSL2 does not natively support USB devices (needed for Kinect) without `usbipd-w
 3. Verify access with `lsusb` inside WSL.
 4. Note: GUI windows (OpenCV) require an X Server (like VcXsrv) or WSLg (Windows 11).
 
-## 5. Verify Installation
+## 6. Verify Installation
 
 Run the dummy camera mode to check software dependencies:
 ```bash
