@@ -146,6 +146,11 @@ def _load_libraries():
         _lib_sync.freenect_sync_get_depth.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_uint32), ctypes.c_int, ctypes.c_int]
         _lib_sync.freenect_sync_get_depth.restype = ctypes.c_int
 
+        # void freenect_sync_stop(void);
+        if hasattr(_lib_sync, 'freenect_sync_stop'):
+            _lib_sync.freenect_sync_stop.argtypes = []
+            _lib_sync.freenect_sync_stop.restype = None
+
 # Load libs on module import
 _load_libraries()
 
@@ -188,6 +193,10 @@ def set_led(dev, option):
     res = _lib.freenect_set_led(dev, int(option))
     if res < 0:
         logger.error(f"freenect_set_led failed with code {res}")
+
+def sync_stop():
+    if _lib_sync and hasattr(_lib_sync, 'freenect_sync_stop'):
+        _lib_sync.freenect_sync_stop()
 
 def sync_get_video(index=0, format=VIDEO_RGB):
     if _lib_sync is None:
