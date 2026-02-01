@@ -62,6 +62,7 @@ class RKNNDetector(BaseDetector):
     def __init__(self, model_path, input_size=(640, 640), conf_thres=0.25, iou_thres=0.45):
         if not RKNN_AVAILABLE:
             logging.error("rknnlite not installed. Cannot load .rknn model.")
+            logging.error("Please run 'bash scripts/install_rknn_opi5.sh' to install it for Orange Pi 5 NPU support.")
             self.rknn = None
             return
 
