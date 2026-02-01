@@ -1,75 +1,98 @@
-import ctypes
-import numpy as np
-import os
-import logging
+import math
 
 class CameraProjector:
     def __init__(self, fov_h=57.0, fov_v=43.0, cam_height=1.0, tilt_angle=0.0):
-        self.lib = self._load_library()
-
-        # Init C++ Object
-        self.lib.Projector_new.argtypes = [ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double]
-        self.lib.Projector_new.restype = ctypes.c_void_p
-
-        self.obj = self.lib.Projector_new(fov_h, fov_v, cam_height, tilt_angle)
-
-        self.fov_h_deg = fov_h
-        self.height = cam_height
-        self.tilt = tilt_angle
-        # Max reliable depth for mapping (mirrors C++ default)
+        self.fov_h_rad = math.radians(fov_h)
+        self.fov_v_rad = math.radians(fov_v)
+        self.cam_height = cam_height
+        self.tilt_rad = math.radians(tilt_angle)
         self.max_depth = 8.0
 
-    def __del__(self):
-        if hasattr(self, 'lib') and hasattr(self, 'obj'):
-             self.lib.Projector_delete(self.obj)
-
-    def _load_library(self):
-        # Path relative to this file: ../../src/cpp/build/libperception.so
-        # This file is in src/perception/geometry.py
-        lib_path = os.path.join(os.path.dirname(__file__), '../../src/cpp/build/libperception.so')
-        lib_path = os.path.abspath(lib_path)
-        if not os.path.exists(lib_path):
-             # Fallback or error?
-             logging.error(f"C++ Library not found at {lib_path}")
-        return ctypes.CDLL(lib_path)
-
     def update_config(self, height, tilt):
-        self.lib.Projector_update_config.argtypes = [ctypes.c_void_p, ctypes.c_double, ctypes.c_double]
-        self.lib.Projector_update_config(self.obj, height, tilt)
-        self.height = height
-        self.tilt = tilt
+        self.cam_height = height
+        self.tilt_rad = math.radians(tilt)
 
     def pixel_to_world(self, u, v, depth_m, W, H, robot_pose):
-        self.lib.Projector_pixel_to_world.argtypes = [ctypes.c_void_p, ctypes.c_double, ctypes.c_double, ctypes.c_double,
-                                                      ctypes.c_int, ctypes.c_int,
-                                                      ctypes.c_double, ctypes.c_double, ctypes.c_double,
-                                                      ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double)]
+        # 1. Intrinsics
+        # Avoid division by zero if fov is 0 (unlikely but safe to check?)
+        # Standard usage assumes non-zero FOV.
+        fx = W / (2.0 * math.tan(self.fov_h_rad / 2.0))
+        fy = H / (2.0 * math.tan(self.fov_v_rad / 2.0))
+        cx = W / 2.0
+        cy = H / 2.0
 
+        # 2. Camera Frame (x_c, y_c, z_c)
+        z_c = depth_m
+        x_c = (u - cx) * z_c / fx
+        y_c = (v - cy) * z_c / fy
+
+        # 3. Tilt Rotation (Around X-axis of Opt Frame)
+        c = math.cos(self.tilt_rad)
+        s = math.sin(self.tilt_rad)
+
+        # P_tilted = R_tilt * P_cam
+        # Rot around X:
+        # [1  0  0]
+        # [0  c -s]
+        # [0  s  c]
+        x_t = x_c
+        y_t = y_c * c - z_c * s
+        z_t = y_c * s + z_c * c
+
+        # 4. To Robot Frame
+        # X_rob = Z_opt_tilted
+        # Y_rob = -X_opt_tilted
+        # Z_rob = -Y_opt_tilted + height
+        x_r = z_t
+        y_r = -x_t
+        z_r = -y_t + self.cam_height
+
+        # 5. To World Frame
+        # Robot Pose (rx, ry, rtheta)
+        # Rot around Z:
+        # [cr -sr  0]
+        # [sr  cr  0]
+        # [ 0   0  1]
         rx, ry, rtheta = robot_pose
-        ox = ctypes.c_double()
-        oy = ctypes.c_double()
-        oz = ctypes.c_double()
+        cr = math.cos(rtheta)
+        sr = math.sin(rtheta)
 
-        self.lib.Projector_pixel_to_world(self.obj, u, v, depth_m, W, H, rx, ry, rtheta,
-                                          ctypes.byref(ox), ctypes.byref(oy), ctypes.byref(oz))
+        x_w = x_r * cr - y_r * sr + rx
+        y_w = x_r * sr + y_r * cr + ry
+        z_w = z_r
 
-        return ox.value, oy.value, oz.value
+        return x_w, y_w, z_w
 
     def is_in_frustum(self, obj_x, obj_y, robot_pose):
-        self.lib.Projector_is_in_frustum.argtypes = [ctypes.c_void_p, ctypes.c_double, ctypes.c_double,
-                                                     ctypes.c_double, ctypes.c_double, ctypes.c_double]
-        self.lib.Projector_is_in_frustum.restype = ctypes.c_bool
-
         rx, ry, rtheta = robot_pose
-        return self.lib.Projector_is_in_frustum(self.obj, obj_x, obj_y, rx, ry, rtheta)
+        dx = obj_x - rx
+        dy = obj_y - ry
+        dist = math.sqrt(dx*dx + dy*dy)
+
+        if dist > self.max_depth:
+            return False
+
+        obj_angle = math.atan2(dy, dx)
+        diff = obj_angle - rtheta
+
+        # Normalize -PI to PI
+        while diff > math.pi: diff -= 2*math.pi
+        while diff < -math.pi: diff += 2*math.pi
+
+        return abs(diff) < (self.fov_h_rad / 2.0)
 
     def get_frustum_polygon(self, robot_pose):
-        self.lib.Projector_get_frustum.argtypes = [ctypes.c_void_p, ctypes.c_double, ctypes.c_double, ctypes.c_double,
-                                                   ctypes.POINTER(ctypes.c_double)]
-
         rx, ry, rtheta = robot_pose
-        # 3 points * 2 coords = 6 doubles
-        out_arr = (ctypes.c_double * 6)()
-        self.lib.Projector_get_frustum(self.obj, rx, ry, rtheta, out_arr)
+        alpha = self.fov_h_rad / 2.0
 
-        return [(out_arr[0], out_arr[1]), (out_arr[2], out_arr[3]), (out_arr[4], out_arr[5])]
+        p1 = (rx, ry)
+
+        lx = rx + self.max_depth * math.cos(rtheta + alpha)
+        ly = ry + self.max_depth * math.sin(rtheta + alpha)
+        p2 = (lx, ly)
+
+        rx_pt = rx + self.max_depth * math.cos(rtheta - alpha)
+        ry_pt = ry + self.max_depth * math.sin(rtheta - alpha)
+        p3 = (rx_pt, ry_pt)
+
+        return [p1, p2, p3]
